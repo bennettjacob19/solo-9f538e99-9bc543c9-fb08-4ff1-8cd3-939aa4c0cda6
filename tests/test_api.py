@@ -13,7 +13,9 @@ from app.packets import HEADER_SIZE, build_packet, parse_packet
 
 
 @pytest.fixture()
-def client():
+def client(tmp_path, monkeypatch):
+    # 每个用例独立数据库文件（并确保源码目录不被测试污染）
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probes.db"))
     # 每个用例一套全新 lifespan：回显端状态、epoch、历史记录都重置
     with TestClient(app) as c:
         yield c

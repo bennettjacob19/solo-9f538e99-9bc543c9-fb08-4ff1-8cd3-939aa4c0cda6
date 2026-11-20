@@ -10,6 +10,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# 探测记录目录（docker-compose 会挂载为卷）
+ENV PROBE_DB_PATH=/data/probes.db
+RUN mkdir -p /data
+VOLUME ["/data"]
+
 # 8000/tcp: HTTP API 与 /docs；9999/udp: 本地回显端
 EXPOSE 8000/tcp 9999/udp
 

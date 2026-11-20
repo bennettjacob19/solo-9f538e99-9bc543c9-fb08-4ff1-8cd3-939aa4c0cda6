@@ -11,10 +11,18 @@
 - 探测期间回显端配置（epoch）变化 → 本次结论作废（invalidated）；
 - 范围内全部确认 → 达到范围上限（reached_range_max）；
 - 范围下限都确认不了（但链路正常）→ below_range。
+
+持久化约束：
+- 每次尝试先落盘 seq / size / purpose，提交成功后才发包；尝试结束后再落盘
+  回包 / 超时 / 发送失败结果；
+- 最后一次尝试结果与终态全部提交成功后才返回最终结论；
+- 任一记录写入失败 → 立即停止本次探测，尽力记录 write_failed 终态并报告，
+  已落盘记录原样保留。
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +33,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .echo_server import EchoState
 from .netutil import set_dont_fragment
 from .packets import HEADER_SIZE, MAX_UDP_PAYLOAD, build_packet, parse_packet
+from .store import (
+    DEFAULT_WRITE_FAILED_REASON,
+    ProbeStore,
+    ProbeStoreError,
+    utcnow,
+)
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # API 模型
@@ -48,22 +64,42 @@ class ProbeRequest(BaseModel):
         return self
 
 
+AttemptOutcome = Literal["ok", "timeout", "send_error"]
+ProbeStatus = Literal[
+    "ok", "below_range", "undetermined", "invalidated",
+    "interrupted", "write_failed", "failed",
+]
+
+
 class AttemptOut(BaseModel):
     seq: int
     size: int
     purpose: Literal["probe", "link-verify"]
-    outcome: Literal["ok", "timeout", "send_error"]
+    outcome: AttemptOutcome
     rtt_ms: Optional[float] = None
     detail: Optional[str] = None
 
 
+class AttemptDetail(BaseModel):
+    seq: int
+    size: int
+    purpose: Literal["probe", "link-verify"]
+    registered_at: datetime
+    outcome: Literal["ok", "timeout", "send_error", "pending", "unconfirmed"]
+    rtt_ms: Optional[float] = None
+    detail: Optional[str] = None
+    finished_at: Optional[datetime] = None
+
+
 class ProbeResult(BaseModel):
     probe_id: str
-    status: Literal["ok", "below_range", "undetermined", "invalidated"]
+    mode: Literal["sync", "background"] = Field("sync", description="sync=同步入口，background=后台入口")
+    status: ProbeStatus
     max_confirmed_size: Optional[int] = Field(
         None, description="本次确认可用的最大 UDP 负载；undetermined 时为已确认下界，invalidated 时作废为 null"
     )
-    reason: Optional[str] = Field(None, description="无法判定 / 结论作废 / 低于范围时的原因")
+    reason: Optional[str] = Field(None, description="无法判定 / 结论作废 / 低于范围 / 中断等的原因")
+    error: Optional[str] = Field(None, description="write_failed / failed 时的错误详情")
     reached_range_max: bool = False
     min_size: int
     max_size: int
@@ -76,6 +112,43 @@ class ProbeResult(BaseModel):
     started_at: datetime
     finished_at: datetime
     duration_ms: float
+
+
+class ProbeDetail(BaseModel):
+    """``GET /probe/{probe_id}``：进行中或已结束的探测及逐次尝试。"""
+
+    probe_id: str
+    mode: Literal["sync", "background"]
+    status: Literal[
+        "queued", "running", "ok", "below_range", "undetermined",
+        "invalidated", "interrupted", "write_failed", "failed",
+    ]
+    request: ProbeRequest
+    target: str
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    duration_ms: Optional[float] = None
+    df_enabled: Optional[bool] = None
+    stray_replies: int = 0
+    config_epoch_start: Optional[int] = None
+    config_epoch_end: Optional[int] = None
+    max_confirmed_size: Optional[int] = None
+    reached_range_max: bool = False
+    reason: Optional[str] = None
+    error: Optional[str] = None
+    attempts: list[AttemptDetail] = Field(default_factory=list)
+
+
+class ProbeSummary(BaseModel):
+    probe_id: str
+    mode: Literal["sync", "background"]
+    status: str
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    max_confirmed_size: Optional[int] = None
+    reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,75 +174,219 @@ class _Inbound(asyncio.DatagramProtocol):
         self.queue.put_nowait(("error", exc))
 
 
+class _AttemptRecordFailure(Exception):
+    def __init__(self, exc: ProbeStoreError) -> None:
+        super().__init__(str(exc))
+        self.exc = exc
+
+
 class Prober:
     def __init__(self, state: EchoState, default_target: tuple[str, int]) -> None:
         self._state = state
         self._default_target = default_target
 
-    async def probe(self, req: ProbeRequest) -> ProbeResult:
-        probe_id = uuid.uuid4()
-        started_at = datetime.now(timezone.utc)
-        t0 = time.monotonic()
+    # ------------------------------------------------------------------ 任务登记
+
+    def resolve_target(self, req: ProbeRequest) -> tuple[str, int]:
         host, port = self._default_target
         if req.target_host is not None:
             host = req.target_host
         if req.target_port is not None:
             port = req.target_port
-        target = f"{host}:{port}"
+        return host, port
 
+    def create_task(
+        self,
+        req: ProbeRequest,
+        store: ProbeStore,
+        *,
+        mode: Literal["sync", "background"],
+        probe_id: Optional[str] = None,
+    ) -> str:
+        """先保存任务（queued），返回探测编号。提交失败则抛出 ProbeStoreError。"""
+        probe_id = probe_id or str(uuid.uuid4())
+        host, port = self.resolve_target(req)
+        store.create_probe(
+            probe_id,
+            mode=mode,
+            request_json=req.model_dump_json(),
+            min_size=req.min_size,
+            max_size=req.max_size,
+            timeout_ms=req.timeout_ms,
+            small_size=req.small_size,
+            target=f"{host}:{port}",
+            created_at=utcnow(),
+        )
+        return probe_id
+
+    # ------------------------------------------------------------------ 执行
+
+    async def run(
+        self,
+        req: ProbeRequest,
+        probe_id: str,
+        store: ProbeStore,
+        *,
+        mode: Literal["sync", "background"] = "sync",
+    ) -> ProbeResult:
+        """执行已登记任务。
+
+        记录写入失败、或任务已不处于 queued（例如重启恢复时被标记中断）
+        时停止探测并返回 write_failed / 中断结果；后者绝不发包。
+        """
+        host, port = self.resolve_target(req)
+        target = f"{host}:{port}"
+        started_at = utcnow()
+        t0 = time.monotonic()
         epoch_start = self._state.epoch
         attempts: list[AttemptOut] = []
         stray = 0
         seq = 0
+        df_ok = False
+
+        # 先确认任务仍是 queued：重启恢复后任务已被标记中断，不得重发
+        try:
+            record = store.get_probe(probe_id)
+        except ProbeStoreError as exc:
+            return self._write_failed_result(
+                store, probe_id, mode, req, target, attempts, stray,
+                epoch_start, None, started_at, t0, exc, published=False,
+            )
+        if record is None or record["probe"]["status"] != "queued":
+            current = record["probe"]["status"] if record else "missing"
+            return ProbeResult(
+                probe_id=probe_id,
+                mode=mode,
+                status="interrupted" if current == "interrupted" else "failed",
+                max_confirmed_size=None,
+                reason=(
+                    DEFAULT_INTERRUPTED_REASON
+                    if current == "interrupted"
+                    else f"探测任务当前状态为 {current}，未执行"
+                ),
+                error=None,
+                reached_range_max=False,
+                min_size=req.min_size,
+                max_size=req.max_size,
+                attempts=[],
+                stray_replies=0,
+                config_epoch_start=epoch_start,
+                config_epoch_end=self._state.epoch,
+                df_enabled=False,
+                target=target,
+                started_at=started_at,
+                finished_at=utcnow(),
+                duration_ms=0.0,
+            )
 
         # 每次探测运行独立 socket（独立临时端口），并 connect 到回显端：
         # 其他运行的回包、无关数据报在内核层就被过滤，不会到达本 socket。
         loop = asyncio.get_running_loop()
-        transport, proto = await loop.create_datagram_endpoint(
-            _Inbound, remote_addr=(host, port)
-        )
+        transport = None
+        try:
+            transport, proto = await loop.create_datagram_endpoint(
+                _Inbound, remote_addr=(host, port)
+            )
+        except OSError as exc:
+            reason = f"无法发起探测: {exc}"
+            self._finish(
+                store, probe_id, mode, req, target, attempts, stray,
+                status="failed", reason=reason, error=str(exc),
+                max_confirmed_size=None, reached_range_max=False,
+                epoch_start=epoch_start, epoch_end=self._state.epoch,
+                df_enabled=None,
+                started_at=started_at, t0=t0,
+            )
+            raise
+
         sock = transport.get_extra_info("socket")
         df_ok = set_dont_fragment(sock) if sock is not None else False
         queue: asyncio.Queue[tuple[str, object]] = proto.queue
+
+        try:
+            store.mark_running(
+                probe_id,
+                started_at=started_at,
+                df_enabled=df_ok,
+                epoch_start=epoch_start,
+            )
+        except ProbeStoreError as exc:
+            transport.close()
+            return self._write_failed_result(
+                store, probe_id, mode, req, target, attempts, stray,
+                epoch_start, df_ok, started_at, t0, exc,
+            )
 
         async def attempt(size: int, purpose: Literal["probe", "link-verify"]) -> AttemptOut:
             nonlocal seq, stray
             seq += 1
             my_seq = seq
-            payload = build_packet(probe_id, my_seq, size)
+            # 发送前落盘：序号、长度、用途。写入失败 -> 不发送。
+            try:
+                store.register_attempt(
+                    probe_id,
+                    seq=my_seq,
+                    size=size,
+                    purpose=purpose,
+                    registered_at=utcnow(),
+                )
+            except ProbeStoreError as exc:
+                raise _AttemptRecordFailure(exc) from exc
+            payload = build_packet(uuid.UUID(probe_id), my_seq, size)
             t_send = time.monotonic()
             transport.sendto(payload)
             deadline = t_send + req.timeout_ms / 1000.0
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return AttemptOut(seq=my_seq, size=size, purpose=purpose, outcome="timeout")
+                    result = AttemptOut(
+                        seq=my_seq, size=size, purpose=purpose, outcome="timeout"
+                    )
+                    break
                 try:
                     kind, obj = await asyncio.wait_for(queue.get(), remaining)
                 except asyncio.TimeoutError:
-                    return AttemptOut(seq=my_seq, size=size, purpose=purpose, outcome="timeout")
+                    result = AttemptOut(
+                        seq=my_seq, size=size, purpose=purpose, outcome="timeout"
+                    )
+                    break
                 if kind == "error":
                     # 发送失败（如 EMSGSIZE：DF 下超过路径 MTU）
                     exc = obj
-                    return AttemptOut(
+                    result = AttemptOut(
                         seq=my_seq, size=size, purpose=purpose,
                         outcome="send_error",
                         detail=f"{type(exc).__name__}: {exc}",
                     )
+                    break
                 pkt = parse_packet(obj)  # type: ignore[arg-type]
                 if (
                     pkt is not None
-                    and pkt.session_id == probe_id
+                    and pkt.session_id == uuid.UUID(probe_id)
                     and pkt.seq == my_seq
                     and pkt.size == size
                 ):
                     rtt = (time.monotonic() - t_send) * 1000.0
-                    return AttemptOut(
+                    result = AttemptOut(
                         seq=my_seq, size=size, purpose=purpose,
                         outcome="ok", rtt_ms=round(rtt, 3),
                     )
+                    break
                 # 迟到/不对应回包：丢弃不采信，继续等到超时为止
                 stray += 1
+            # 尝试结束后落盘结果；失败同样停止探测
+            try:
+                store.save_attempt_result(
+                    probe_id,
+                    seq=my_seq,
+                    outcome=result.outcome,
+                    rtt_ms=result.rtt_ms,
+                    detail=result.detail,
+                    finished_at=utcnow(),
+                )
+            except ProbeStoreError as exc:
+                raise _AttemptRecordFailure(exc) from exc
+            return result
 
         def epoch_broken() -> bool:
             return self._state.epoch != epoch_start
@@ -180,10 +397,11 @@ class Prober:
                 f"探测期间回显端配置发生变化（epoch {epoch_start} → {self._state.epoch}），本次结论作废",
             )
 
-        status: Literal["ok", "below_range", "undetermined", "invalidated"] = "ok"
+        status: str = "ok"
         reason: Optional[str] = None
         best: Optional[int] = None
         lo, hi = req.min_size, req.max_size
+        record_failure: Optional[ProbeStoreError] = None
 
         try:
             while lo <= hi:
@@ -192,14 +410,22 @@ class Prober:
                     best = None
                     break
                 mid = (lo + hi) // 2
-                att = await attempt(mid, "probe")
+                try:
+                    att = await attempt(mid, "probe")
+                except _AttemptRecordFailure as exc:
+                    record_failure = exc.exc
+                    break
                 attempts.append(att)
                 if att.outcome == "ok":
                     best = mid
                     lo = mid + 1
                     continue
                 # 大包失败（超时或发送失败）→ 小包复核链路
-                verify = await attempt(req.small_size, "link-verify")
+                try:
+                    verify = await attempt(req.small_size, "link-verify")
+                except _AttemptRecordFailure as exc:
+                    record_failure = exc.exc
+                    break
                 attempts.append(verify)
                 if verify.outcome == "ok":
                     hi = mid - 1  # 链路正常，确为尺寸受限
@@ -216,10 +442,8 @@ class Prober:
                     )
                     # 保留此前已确认的下界，但绝不把失败尺寸当作上限
                 break
-            else:
-                pass
 
-            if status == "ok":
+            if record_failure is None and status == "ok":
                 if epoch_broken():
                     status, reason = invalidated_result()
                     best = None
@@ -232,22 +456,141 @@ class Prober:
         finally:
             transport.close()
 
-        finished_at = datetime.now(timezone.utc)
-        return ProbeResult(
-            probe_id=str(probe_id),
-            status=status,
+        if record_failure is not None:
+            return self._write_failed_result(
+                store, probe_id, mode, req, target, attempts, stray,
+                epoch_start, df_ok, started_at, t0, record_failure,
+            )
+
+        # 最后一次尝试结果已落盘；提交终态成功后才发布结论
+        return self._finish(
+            store, probe_id, mode, req, target, attempts, stray,
+            status=status, reason=reason,
+            error=None,
             max_confirmed_size=best,
-            reason=reason,
             reached_range_max=(status == "ok" and best == req.max_size),
+            epoch_start=epoch_start,
+            epoch_end=self._state.epoch,
+            df_enabled=df_ok,
+            started_at=started_at, t0=t0,
+        )
+
+    # ------------------------------------------------------------------ 收尾
+
+    def _finish(
+        self,
+        store: ProbeStore,
+        probe_id: str,
+        mode: Literal["sync", "background"],
+        req: ProbeRequest,
+        target: str,
+        attempts: list[AttemptOut],
+        stray: int,
+        *,
+        status: str,
+        reason: Optional[str],
+        error: Optional[str],
+        max_confirmed_size: Optional[int],
+        reached_range_max: bool,
+        epoch_start: int,
+        epoch_end: int,
+        df_enabled: Optional[bool],
+        started_at: datetime,
+        t0: float,
+    ) -> ProbeResult:
+        finished_at = utcnow()
+        duration_ms = round((time.monotonic() - t0) * 1000.0, 3)
+        try:
+            store.finalize(
+                probe_id,
+                status=status,
+                reason=reason,
+                error=error,
+                max_confirmed_size=max_confirmed_size,
+                reached_range_max=reached_range_max,
+                stray_replies=stray,
+                config_epoch_start=epoch_start,
+                config_epoch_end=epoch_end,
+                df_enabled=df_enabled,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+        except ProbeStoreError as exc:
+            # 终态未落盘 -> 不发布结论，报告写入失败
+            return self._write_failed_result(
+                store, probe_id, mode, req, target, attempts, stray,
+                epoch_end, df_enabled, started_at, t0, exc,
+            )
+        return ProbeResult(
+            probe_id=probe_id,
+            mode=mode,
+            status=status,  # type: ignore[arg-type]
+            max_confirmed_size=max_confirmed_size,
+            reason=reason,
+            error=error,
+            reached_range_max=reached_range_max,
+            min_size=req.min_size,
+            max_size=req.max_size,
+            attempts=attempts,
+            stray_replies=stray,
+            config_epoch_start=epoch_start,
+            config_epoch_end=epoch_end,
+            df_enabled=bool(df_enabled),
+            target=target,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+        )
+
+    def _write_failed_result(
+        self,
+        store: ProbeStore,
+        probe_id: str,
+        mode: Literal["sync", "background"],
+        req: ProbeRequest,
+        target: str,
+        attempts: list[AttemptOut],
+        stray: int,
+        epoch_start: int,
+        df_enabled: Optional[bool],
+        started_at: datetime,
+        t0: float,
+        exc: ProbeStoreError,
+        published: bool = True,
+    ) -> ProbeResult:
+        finished_at = utcnow()
+        duration_ms = round((time.monotonic() - t0) * 1000.0, 3)
+        error = str(exc)
+        logger.error("探测 %s 记录写入失败，已停止: %s", probe_id, error)
+        if published:
+            try:
+                store.mark_write_failed(
+                    probe_id,
+                    error=error,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_ms=duration_ms,
+                )
+            except ProbeStoreError as mark_exc:
+                logger.error("探测 %s 写入失败状态也未能落盘: %s", probe_id, mark_exc)
+        return ProbeResult(
+            probe_id=probe_id,
+            mode=mode,
+            status="write_failed",
+            max_confirmed_size=None,
+            reason=DEFAULT_WRITE_FAILED_REASON,
+            error=error,
+            reached_range_max=False,
             min_size=req.min_size,
             max_size=req.max_size,
             attempts=attempts,
             stray_replies=stray,
             config_epoch_start=epoch_start,
             config_epoch_end=self._state.epoch,
-            df_enabled=df_ok,
+            df_enabled=bool(df_enabled),
             target=target,
             started_at=started_at,
             finished_at=finished_at,
-            duration_ms=round((time.monotonic() - t0) * 1000.0, 3),
+            duration_ms=duration_ms,
         )

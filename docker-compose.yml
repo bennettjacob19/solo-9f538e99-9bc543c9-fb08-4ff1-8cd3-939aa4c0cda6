@@ -9,4 +9,11 @@ services:
       ECHO_HOST: 0.0.0.0        # 回显端监听地址
       ECHO_PORT: "9999"         # 回显端 UDP 端口
       PROBE_TARGET_HOST: 127.0.0.1  # 探测默认目标（容器内本地回显端）
+      PROBE_DB_PATH: /data/probes.db   # 探测记录（同步/后台入口共用）
+      PROBE_MAX_FINISHED: "200"        # 仅保留最近结束的 200 条，进行中全部保留
+    volumes:
+      - probe-data:/data       # 重启/重建容器后仍可查询探测进度与结论
     restart: unless-stopped
+
+volumes:
+  probe-data:
